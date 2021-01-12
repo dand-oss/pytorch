@@ -126,6 +126,12 @@ public:
   template<class Return, class... Args>
   Return callWithDispatchKey(const TypedOperatorHandle<Return (Args...)>& op, DispatchKey dispatchKey, Args... args) const;
 
+  // Like callWithDispatchKey, but provides the dispatch key as a set of keys.
+  // The dispatch key with highest priority is used.
+  // See Note [Plumbing Keys Through The Dispatcher]
+  template<class Return, class... Args>
+  Return callWithDispatchKeySet(const TypedOperatorHandle<Return (Args...)>& op, DispatchKeySet dispatchKeySet, Args... args) const;
+
   // Like call, but intended for use in a redispatch: you are currently
   // in some currentDispatchKey, you have finished processing the key and
   // you now want to redispatch to the next dispatch key in the chain.
@@ -134,8 +140,16 @@ public:
   template<class Return, class... Args>
   Return redispatch(const TypedOperatorHandle<Return (Args...)>& op, DispatchKey currentDispatchKey, Args... args) const;
 
+
+  template<class Return, class... Args>
+  Return redispatch(const TypedOperatorHandle<Return (Args...)>& op, DispatchKeySet currentDispatchKeySet, Args... args) const;
+
   // Invoke an operator via the boxed calling convention using an IValue stack
   void callBoxed(const OperatorHandle& op, Stack* stack) const;
+
+  // TODO: This will only be useful if we write a backend fallback that plumbs dispatch keys (currently there are none)
+  // See Note [Plumbing Keys Through The Dispatcher]
+  void callBoxed(const OperatorHandle& op, DispatchKeySet dispatchKeySet, Stack* stack) const;
 
   // ------------------------------------------------------------------------
   //
@@ -349,6 +363,11 @@ public:
     return c10::Dispatcher::singleton().callWithDispatchKey<Return, Args...>(*this, dispatchKey, std::forward<Args>(args)...);
   }
 
+  // Note: benchmarks showed that this function wasn't getting inlined during calls to at::empty
+  C10_ALWAYS_INLINE Return callWithDispatchKeySet(DispatchKeySet dispatchKeySet, Args... args) const {
+    return c10::Dispatcher::singleton().callWithDispatchKeySet<Return, Args...>(*this, dispatchKeySet, std::forward<Args>(args)...);
+  }
+
 private:
   explicit TypedOperatorHandle(std::list<Dispatcher::OperatorDef>::iterator operatorIterator)
   : OperatorHandle(std::move(operatorIterator)) {}
@@ -364,6 +383,11 @@ inline Return Dispatcher::callWithDispatchKey(const TypedOperatorHandle<Return(A
   detail::unused_arg_(args...);  // workaround for a false-positive warning about unused parameters in gcc 5
   // No alias dispatch key is allowed at runtime.
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(!c10::isAliasDispatchKey(dispatchKey));
+  auto dispatchKeySet = op.operatorIterator_->op.dispatchKeyExtractor()
+    .template getDispatchKeySetUnboxed<Args...>(
+      DispatchKeySet(DispatchKeySet::FULL_AFTER, dispatchKey),
+      args...
+    );
   const KernelFunction& kernel = op.operatorIterator_->op.lookup(dispatchKey);
 
 #ifndef PYTORCH_DISABLE_PER_OP_PROFILING
@@ -399,41 +423,98 @@ inline Return Dispatcher::callWithDispatchKey(const TypedOperatorHandle<Return(A
       }
     }
     // keeping the guard alive while executing the kernel
-    return kernel.template call<Return, Args...>(op, std::forward<Args>(args)...);
+    return kernel.template call<Return, Args...>(op, dispatchKeySet, std::forward<Args>(args)...);
   }
 #endif  // PYTORCH_DISABLE_PER_OP_PROFILING
-  return kernel.template call<Return, Args...>(op, std::forward<Args>(args)...);
+  return kernel.template call<Return, Args...>(op, dispatchKeySet, std::forward<Args>(args)...);
+}
+
+template<class Return, class... Args>
+// Note: benchmarks showed that this function wasn't getting inlined during calls to at::empty
+C10_ALWAYS_INLINE Return Dispatcher::callWithDispatchKeySet(const TypedOperatorHandle<Return(Args...)>& op, DispatchKeySet dispatchKeySet, Args... args) const {
+  detail::unused_arg_(args...);  // workaround for a false-positive warning about unused parameters in gcc 5
+  // No alias dispatch key is allowed at runtime.
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(!c10::isAliasDispatchKey(dispatchKeySet.highestPriorityTypeId()));
+  const KernelFunction& kernel = op.operatorIterator_->op.lookup(dispatchKeySet.highestPriorityTypeId());
+
+#ifndef PYTORCH_DISABLE_PER_OP_PROFILING
+  // By default, when there're no high-frequency or non-sampled callbacks,
+  // RecordFunction is pre-sampled as a perf optimization;
+  // shouldRunRecordFunction checks whether RecordFunction should be executed,
+  // and sets pre_sampled boolean argument value to whether pre-sampling was used -
+  // this boolean is passed into RecordFunction to adjust the sampling rates of
+  // the callbacks
+  bool pre_sampled = false;
+  if (C10_UNLIKELY(at::shouldRunRecordFunction(&pre_sampled))) {
+    // Check if we need to run callbacks registered with RecordFunction
+    // If true and callbacks need inputs, we box the arguments and pass
+    // them into the callbacks and also into the kernel call
+
+    // Note: for perf reasons we wouldn't want to pass arguments into
+    // the function call or prematurely box them
+    at::RecordFunction guard(at::RecordScope::FUNCTION, pre_sampled);
+    if (C10_UNLIKELY(guard.isActive())) {
+      auto dispatchKey = dispatchKeySet.highestPriorityTypeId();
+      if (shouldRecord(dispatchKey) && op.operatorIterator_->op.isObserved()) {
+        int64_t seq_num = -1;
+        // Setting sequence number in the Autograd case to associate
+        // the forward range with the coresponding Autograd's node
+        if (isIncludedInAlias(dispatchKey, DispatchKey::Autograd) && at::GradMode::is_enabled()) {
+          seq_num = at::sequence_number::peek();
+        }
+        if (guard.needsInputs()) {
+          torch::jit::Stack stack = impl::boxArgs(args...);
+          guard.before(op, stack, seq_num);
+        } else {
+          guard.before(op, seq_num);
+        }
+      }
+    }
+    // keeping the guard alive while executing the kernel
+    return kernel.template call<Return, Args...>(op, dispatchKeySet, std::forward<Args>(args)...);
+  }
+#endif  // PYTORCH_DISABLE_PER_OP_PROFILING
+  return kernel.template call<Return, Args...>(op, dispatchKeySet, std::forward<Args>(args)...);
 }
 
 template<class Return, class... Args>
 inline Return Dispatcher::call(const TypedOperatorHandle<Return(Args...)>& op, Args... args) const {
   detail::unused_arg_(args...);  // workaround for a false-positive warning about unused parameters in gcc 5
-  auto dispatchKey = op.operatorIterator_->op.dispatchKeyExtractor()
-    .template getDispatchKeyUnboxed<Args...>(
+  auto dispatchKeySet = op.operatorIterator_->op.dispatchKeyExtractor()
+    .template getDispatchKeySetUnboxed<Args...>(
       DispatchKeySet::FULL,
       args...
     );
-  return callWithDispatchKey<Return, Args...>(op, dispatchKey, args...);
+  return callWithDispatchKeySet<Return, Args...>(op, dispatchKeySet, args...);
 }
 
 template<class Return, class... Args>
 inline Return Dispatcher::redispatch(const TypedOperatorHandle<Return (Args...)>& op, DispatchKey currentDispatchKey, Args... args) const {
   detail::unused_arg_(args...);  // workaround for a false-positive warning about unused parameters in gcc 5
-  auto dispatchKey = op.operatorIterator_->op.dispatchKeyExtractor()
-    .template getDispatchKeyUnboxed<Args...>(
+  auto currentDispatchKeySet = op.operatorIterator_->op.dispatchKeyExtractor()
+    .template getDispatchKeySetUnboxed<Args...>(
       DispatchKeySet(DispatchKeySet::FULL_AFTER, currentDispatchKey),
       args...
     );
   // do not use RecordFunction on redispatch
-  const KernelFunction& kernel = op.operatorIterator_->op.lookup(dispatchKey);
-  return kernel.template call<Return, Args...>(op, std::forward<Args>(args)...);
+  const KernelFunction& kernel = op.operatorIterator_->op.lookup(currentDispatchKeySet.highestPriorityTypeId());
+  return kernel.template call<Return, Args...>(op, currentDispatchKeySet, std::forward<Args>(args)...);
+}
+
+// TODO: temp
+template<class Return, class... Args>
+inline Return Dispatcher::redispatch(const TypedOperatorHandle<Return (Args...)>& op, DispatchKeySet currentDispatchKeySet, Args... args) const {
+  detail::unused_arg_(args...);  // workaround for a false-positive warning about unused parameters in gcc 5
+  // do not use RecordFunction on redispatch
+  const KernelFunction& kernel = op.operatorIterator_->op.lookup(currentDispatchKeySet.highestPriorityTypeId());
+  return kernel.template call<Return, Args...>(op, currentDispatchKeySet, std::forward<Args>(args)...);
 }
 
 inline void Dispatcher::callBoxed(const OperatorHandle& op, Stack* stack) const {
   // note: this doesn't need the mutex because write operations on the list keep iterators intact.
   const auto& entry = op.operatorIterator_->op;
-  auto dispatchKey = entry.dispatchKeyExtractor().getDispatchKeyBoxed(stack);
-  const auto& kernel = entry.lookup(dispatchKey);
+  auto dispatchKeySet = entry.dispatchKeyExtractor().getDispatchKeySetBoxed(stack);
+  const auto& kernel = entry.lookup(dispatchKeySet.highestPriorityTypeId());
 
 #ifndef PYTORCH_DISABLE_PER_OP_PROFILING
   bool pre_sampled = false;
@@ -441,6 +522,7 @@ inline void Dispatcher::callBoxed(const OperatorHandle& op, Stack* stack) const 
     // using already existing stack to record function execution in observers
     at::RecordFunction guard(at::RecordScope::FUNCTION, pre_sampled);
     if (C10_UNLIKELY(guard.isActive())) {
+      auto dispatchKey = dispatchKeySet.highestPriorityTypeId();
       if (shouldRecord(dispatchKey) && entry.isObserved()) {
         int64_t seq_num = -1;
         if (isIncludedInAlias(dispatchKey, DispatchKey::Autograd) && at::GradMode::is_enabled()) {
@@ -454,11 +536,43 @@ inline void Dispatcher::callBoxed(const OperatorHandle& op, Stack* stack) const 
       }
     }
     // keeping the guard alive while executing the kernel
-    kernel.callBoxed(op, stack);
+    kernel.callBoxed(op, dispatchKeySet, stack);
     return;
   }
 #endif  // PYTORCH_DISABLE_PER_OP_PROFILING
-  kernel.callBoxed(op, stack);
+  kernel.callBoxed(op, dispatchKeySet, stack);
+}
+
+inline void Dispatcher::callBoxed(const OperatorHandle& op, DispatchKeySet dispatchKeySet, Stack* stack) const {
+  // note: this doesn't need the mutex because write operations on the list keep iterators intact.
+  const auto& entry = op.operatorIterator_->op;
+  const auto& kernel = entry.lookup(dispatchKeySet.highestPriorityTypeId());
+
+#ifndef PYTORCH_DISABLE_PER_OP_PROFILING
+  bool pre_sampled = false;
+  if (C10_UNLIKELY(at::shouldRunRecordFunction(&pre_sampled))) {
+    // using already existing stack to record function execution in observers
+    at::RecordFunction guard(at::RecordScope::FUNCTION, pre_sampled);
+    if (C10_UNLIKELY(guard.isActive())) {
+      auto dispatchKey = dispatchKeySet.highestPriorityTypeId();
+      if (shouldRecord(dispatchKey) && entry.isObserved()) {
+        int64_t seq_num = -1;
+        if (isIncludedInAlias(dispatchKey, DispatchKey::Autograd) && at::GradMode::is_enabled()) {
+          seq_num = at::sequence_number::peek();
+        }
+        if (guard.needsInputs()) {
+          guard.before(op, *stack, seq_num);
+        } else {
+          guard.before(op, seq_num);
+        }
+      }
+    }
+    // keeping the guard alive while executing the kernel
+    kernel.callBoxed(op, dispatchKeySet, stack);
+    return;
+  }
+#endif  // PYTORCH_DISABLE_PER_OP_PROFILING
+  kernel.callBoxed(op, dispatchKeySet, stack);
 }
 
 } // namespace c10

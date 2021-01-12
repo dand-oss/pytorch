@@ -3,6 +3,7 @@
 #include <type_traits>
 #include <array>
 #include <functional>
+#include <c10/core/DispatchKeySet.h>
 #include <c10/util/TypeList.h>
 #include <c10/util/Array.h>
 
@@ -17,12 +18,21 @@ namespace c10 { namespace guts {
 template<class Func> struct function_traits {
   static_assert(!std::is_same<Func, Func>::value, "In function_traits<Func>, Func must be a plain function type.");
 };
-template<class Result, class... Args>
-struct function_traits<Result (Args...)> {
-  using func_type = Result (Args...);
+template<class Result>
+struct function_traits<Result ()> {
+  using func_type = Result ();
   using return_type = Result;
-  using parameter_types = typelist::typelist<Args...>;
-  static constexpr auto number_of_parameters = sizeof...(Args);
+  using parameter_types = typelist::typelist<>;
+  static constexpr auto number_of_parameters = 0;
+};
+
+template<class Result, class FirstArg, class... Args>
+struct function_traits<Result (FirstArg, Args...)> {
+  using func_type = Result (FirstArg, Args...);
+  using func_type_skip_first_arg = Result (Args...);
+  using return_type = Result;
+  using parameter_types = typelist::typelist<FirstArg, Args...>;
+  static constexpr auto number_of_parameters = sizeof...(Args) + 1;
 };
 
 /**
