@@ -2,7 +2,11 @@
 
 #ifdef USE_TENSORPIPE
 
-#include <torch/csrc/distributed/rpc/utils.h>
+#ifdef USE_CUDA_NOT_ROCM
+#include <c10/core/DeviceGuard.h>
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <tensorpipe/tensorpipe.h>
+#endif
 
 #include <tensorpipe/core/message.h>
 
@@ -35,9 +39,59 @@ inline c10::Device indexToDevice(c10::DeviceIndex index) {
 
 } // namespace
 
+#ifdef USE_CUDA_NOT_ROCM
+
+inline void CudaLazyStreamContext::blockCurrentStreams() {
+  for (const auto& entry : streams_) {
+    at::cuda::CUDAEvent event;
+    event.record(entry.second);
+    event.block(at::cuda::getCurrentCUDAStream(entry.first));
+  }
+}
+
+inline void CudaLazyStreamContext::waitForCurrentStreams(
+    const std::vector<torch::Tensor>& tensors) {
+  for (const auto& tensor : tensors) {
+    if (tensor.is_cuda()) {
+      getStream(tensor.device().index());
+    }
+  }
+
+  for (const auto& entry : streams_) {
+    at::cuda::CUDAEvent event;
+    event.record(at::cuda::getCurrentCUDAStream(entry.first));
+    event.block(entry.second);
+  }
+}
+
+inline std::vector<CUDAStream> CudaLazyStreamContext::getReservedStreams()
+    const {
+  std::vector<CUDAStream> reservedStreams;
+  reservedStreams.reserve(streams_.size());
+  for (const auto& entry : streams_) {
+    reservedStreams.push_back(entry.second);
+  }
+  return reservedStreams;
+}
+
+inline CUDAStream CudaLazyStreamContext::getStream(c10::DeviceIndex index) {
+  auto iter = streams_.find(index);
+  if (iter == streams_.end()) {
+    auto cudaStream = at::cuda::getStreamFromPool(
+        /* isHighPriority */ false, /* device */ index);
+    streams_.emplace(index, cudaStream);
+    return cudaStream;
+  } else {
+    return iter->second;
+  }
+}
+
+#endif
+
 std::tuple<tensorpipe::Message, TensorpipeWriteBuffers> tensorpipeSerialize(
     Message&& rpcMessage,
-    std::vector<c10::DeviceIndex> deviceIndices) {
+    std::vector<c10::DeviceIndex> deviceIndices,
+    const std::shared_ptr<LazyStreamContext>& ctx) {
   tensorpipe::Message tpMessage;
   TensorpipeWriteBuffers buffers;
 
@@ -62,16 +116,7 @@ std::tuple<tensorpipe::Message, TensorpipeWriteBuffers> tensorpipeSerialize(
       tensorpipe::Message::Payload{payloadPtr, buffers.payload.size()});
 
   // Tensors
-  if (deviceIndices.empty()) {
-    buffers.tensors = cloneSparseTensors(rpcMessage.tensors()).vec();
-  } else {
-    std::vector<torch::Tensor> tensors;
-    tensors.reserve(rpcMessage.tensors().size());
-    for (const auto& tensor : rpcMessage.tensors()) {
-      tensors.emplace_back(tensor.cpu());
-    }
-    buffers.tensors = cloneSparseTensors(tensors).vec();
-  }
+  buffers.tensors = cloneSparseTensors(rpcMessage.tensors()).vec();
 
   torch::jit::Pickler pickler([&](const void* buf, size_t sz) -> size_t {
     buffers.pickle.insert(
@@ -88,7 +133,10 @@ std::tuple<tensorpipe::Message, TensorpipeWriteBuffers> tensorpipeSerialize(
       buffers.pickle.data(), buffers.pickle.size()});
   const auto& tensorDataVec = pickler.tensorData();
   for (size_t i = 0; i < tensorDataVec.size(); ++i) {
-    const auto& tensorData = jit::getWriteableTensorData(tensorDataVec[i]);
+    // This is different from jit::getWriteableTensorData as it avoids copying
+    // tensor to CPU.
+    const auto& tensorData =
+        jit::getWriteableTensorData(tensorDataVec[i], /* toCpu */ false);
     // Enforce memory copy if tensor is created from torch::from_blob, means
     // that the tensor doesn't own the memory.
     std::string metadata =
@@ -106,16 +154,37 @@ std::tuple<tensorpipe::Message, TensorpipeWriteBuffers> tensorpipeSerialize(
       // it uses non-const ptrs even though it doesn't modify them when writing.
       // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
       char* tensorPtr = const_cast<char*>(tensorData.data());
-      tpMessage.tensors.push_back(tensorpipe::Message::Tensor{
-          tensorpipe::CpuBuffer{tensorPtr, tensorData.sizeInBytes()},
-          std::move(metadata)});
+      if (tensorDataVec[i].device().is_cpu()) {
+        tpMessage.tensors.push_back(tensorpipe::Message::Tensor{
+            tensorpipe::CpuBuffer{tensorPtr, tensorData.sizeInBytes()},
+            std::move(metadata)});
+#ifdef USE_CUDA_NOT_ROCM
+      } else if (tensorDataVec[i].device().is_cuda()) {
+        auto stream = ctx->getStream(tensorDataVec[i].device().index());
+        tpMessage.tensors.push_back(tensorpipe::Message::Tensor{
+            tensorpipe::CudaBuffer{
+                tensorPtr, tensorData.sizeInBytes(), stream.stream()},
+            std::move(metadata)});
+        // record tensor data ptrs on TensorPipe streams, so that the tensors
+        // won't be destructed before TensorPipe finishing sending them.
+        c10::cuda::CUDACachingAllocator::recordStream(
+            tensorDataVec[i].storage().data_ptr(), stream);
+#endif
+      } else {
+        TORCH_CHECK(
+            false,
+            "Attempting to send a Tensor with unexpected device type ",
+            tensorDataVec[i].device());
+      }
     }
   }
 
   return std::make_tuple(std::move(tpMessage), std::move(buffers));
 }
 
-TensorpipeReadBuffers tensorpipeAllocate(tensorpipe::Message& tpMessage) {
+TensorpipeReadBuffers tensorpipeAllocate(
+    tensorpipe::Message& tpMessage,
+    const std::shared_ptr<LazyStreamContext>& ctx) {
   TensorpipeReadBuffers buffers;
 
   TORCH_INTERNAL_ASSERT(
@@ -152,9 +221,29 @@ TensorpipeReadBuffers tensorpipeAllocate(tensorpipe::Message& tpMessage) {
   tpMessage.payloads[kTpMessagePickleIdx].data = buffers.pickle.data();
 
   for (auto& tensor : tpMessage.tensors) {
-    buffers.tensors.emplace_back(
-        at::getCPUAllocator()->allocate(tensor.buffer.cpu.length));
-    tensor.buffer.cpu.ptr = buffers.tensors.back().get();
+    if (tensor.buffer.type == tensorpipe::DeviceType::kCpu) {
+      buffers.tensors.emplace_back(
+          at::getCPUAllocator()->allocate(tensor.buffer.cpu.length));
+      tensor.buffer.cpu.ptr = buffers.tensors.back().get();
+#ifdef USE_CUDA_NOT_ROCM
+    } else if (tensor.buffer.type == tensorpipe::DeviceType::kCuda) {
+      auto deviceIndex = std::stoi(tensor.metadata);
+      auto stream = ctx->getStream(deviceIndex);
+      DeviceGuard guard(indexToDevice(deviceIndex));
+      buffers.tensors.emplace_back(
+          c10::cuda::CUDACachingAllocator::get()->allocate(
+              tensor.buffer.cuda.length));
+      tensor.buffer.cuda.ptr = buffers.tensors.back().get();
+      tensor.buffer.cuda.stream = stream.stream();
+
+      // record tensor data ptrs on TensorPipe streams, so that the tensors
+      // won't be destructed before TensorPipe finishing receiving them.
+      c10::cuda::CUDACachingAllocator::recordStream(
+          buffers.tensors.back(), stream);
+#endif
+    } else {
+      TORCH_INTERNAL_ASSERT(false, "Unrecognized TensorPipe buffer type.");
+    }
   }
 
   return buffers;
@@ -185,27 +274,31 @@ Message tensorpipeDeserialize(
   // No need to pass typeResolver here, as it always processes string and
   // tensors only
   torch::jit::Unpickler unpickler(
-      pickleReadFunc, nullptr, nullptr, tensorReadFunc, {});
+      pickleReadFunc,
+      nullptr,
+      nullptr,
+      tensorReadFunc,
+      {},
+      /* use_storage_device*/ true);
+
   auto ival = unpickler.parse_ivalue();
   for (auto&& t : ival.toTensorList()) {
     tensors.emplace_back(std::move(t));
   }
 
-  // NB: This is a temporary solution. When TensorPipe Tensor.data can point to
-  // a CUDA memory address, we should directly use CUDACachingAllocator to
-  // create CUDA buffers in tensorpipeAllocate.
   for (size_t i = 0; i < message.tensors.size(); ++i) {
     auto& tensor = message.tensors[i];
     if (!tensor.metadata.empty()) {
       TORCH_INTERNAL_ASSERT(
-          message.tensors.size() == tensors.size(),
-          "Number of device indices must match the number of tensors in the "
-          "RPC message. But got ",
-          tensors.size(),
-          " tensors with ",
-          message.tensors.size(),
-          " device indices.");
-      tensors[i] = tensors[i].to(indexToDevice(std::stoi(tensor.metadata)));
+          tensors[i].device() == indexToDevice(std::stoi(tensor.metadata)),
+          "Tensor ",
+          i,
+          " in message ",
+          *buffers.id,
+          " was expected to be received on device ",
+          tensor.metadata,
+          ", but got it on ",
+          tensors[i].device());
     }
   }
 
