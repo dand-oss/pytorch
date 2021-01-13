@@ -31,17 +31,20 @@ SourceRange getPythonInterpreterSourceRange() {
   pybind11::gil_scoped_acquire gil;
   PyFrameObject* frame = PyEval_GetFrame();
 
-  while (nullptr != frame) {
-    int line = PyCode_Addr2Line(frame->f_code, frame->f_lasti);
+  // FIXME hacky way to just make it compile
+  // TODO proper PyPy implementation
+  // while (nullptr != frame) {
+    // int line = PyCode_Addr2Line(frame->f_code, frame->f_lasti);
     std::string filename = THPUtils_unpackString(frame->f_code->co_filename);
     std::string funcname = THPUtils_unpackString(frame->f_code->co_name);
-    stack_trace << filename << "(" << line << "): " << funcname << "\n";
+    // stack_trace << filename << "(" << line << "): " << funcname << "\n";
+    stack_trace << filename << funcname << "\n";
     if (!source_filename) {
       source_filename = filename;
-      source_line = line;
+      // source_line = line;
     }
-    frame = frame->f_back;
-  }
+//    frame = frame->f_back;
+//   }
 
   auto stack_trace_text = stack_trace.str();
   auto source =
