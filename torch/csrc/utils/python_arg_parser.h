@@ -678,7 +678,7 @@ static bool _is_basic_python_type(PyTypeObject *tp)
     tp == Py_TYPE(Py_Ellipsis) ||
     tp == Py_TYPE(Py_NotImplemented) ||
 
-    PyModule_Check(tp) ||
+    tp == &PyModule_Type ||
     /* sentinel to swallow trailing || */
     false
   );
