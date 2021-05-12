@@ -32,15 +32,13 @@ std::vector<StackEntry> _pythonCallstack() {
 
   while (nullptr != frame) {
     auto code = THPCodeObjectPtr(PyFrame_GetCode(frame));
-    size_t line = PyCode_Addr2Line(code.get(), PyFrame_GetLasti(frame));
+    // size_t line = PyCode_Addr2Line(code.get(), PyFrame_GetLasti(frame));
+    size_t line = 9999;
     std::string filename = THPUtils_unpackString(code->co_filename);
     std::string funcname = THPUtils_unpackString(code->co_name);
     auto source = std::make_shared<Source>(funcname, filename, line);
     entries.emplace_back(
         StackEntry{funcname, SourceRange(source, 0, funcname.size())});
-    auto new_frame = PyFrame_GetBack(frame);
-    Py_DECREF(frame);
-    frame = new_frame;
   }
   return entries;
 }
