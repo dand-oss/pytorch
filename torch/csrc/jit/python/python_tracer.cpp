@@ -29,13 +29,14 @@ std::vector<StackEntry> _pythonCallstack() {
   std::vector<StackEntry> entries;
 
   while (nullptr != frame) {
-    size_t line = PyCode_Addr2Line(frame->f_code, frame->f_lasti);
+    // size_t line = PyCode_Addr2Line(frame->f_code, frame->f_lasti);
+    size_t line = 9999;
     std::string filename = THPUtils_unpackString(frame->f_code->co_filename);
     std::string funcname = THPUtils_unpackString(frame->f_code->co_name);
     auto source = std::make_shared<Source>(funcname, filename, line);
     entries.emplace_back(
         StackEntry{funcname, SourceRange(source, 0, funcname.size())});
-    frame = frame->f_back;
+    frame = nullptr;
   }
   return entries;
 }

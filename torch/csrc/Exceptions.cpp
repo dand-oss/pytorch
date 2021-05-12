@@ -206,13 +206,7 @@ PyWarningHandler::~PyWarningHandler() noexcept(false) {
         // Note: PyErr_WarnExplicit will disregard Python's warning filter
         // and always appear. This is in contrast to PyErr_WarnEx,
         // which respects the warning filter.
-        result = PyErr_WarnExplicit(
-            /*category=*/PyExc_UserWarning,
-            /*message=*/msg.c_str(),
-            /*filename=*/source_location.file,
-            /*lineno=*/source_location.line,
-            /*module=*/nullptr,
-            /*registry=*/nullptr);
+        result = PyErr_WarnEx(PyExc_UserWarning, msg.c_str(), 1);
       } else {
         // Lets Python set the source location and puts the C++ warning
         // location into the message.
