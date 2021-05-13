@@ -396,7 +396,7 @@ void initJITBindings(PyObject* module) {
             ArgumentSpecCreator arg_spec_creator(*graph);
             Stack stack;
             stack.reserve(inputs.size()); // captures?
-            for (auto& obj : inputs) {
+            for (auto&& obj : inputs) {
               stack.push_back(toTypeInferredIValue(obj));
             }
             ArgumentSpec spec = arg_spec_creator.create(with_grad, stack);
@@ -417,7 +417,7 @@ void initJITBindings(PyObject* module) {
           [](std::shared_ptr<Graph>& graph, const py::tuple& inputs) {
             Stack stack;
             stack.reserve(inputs.size()); // captures?
-            for (auto& obj : inputs) {
+            for (auto&& obj : inputs) {
               stack.push_back(toTypeInferredIValue(obj));
             }
             auto g_inputs = graph->inputs();
