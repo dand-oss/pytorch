@@ -72,7 +72,8 @@ inline int __PySlice_Unpack(
 // Compat macros macros taken from
 // https://docs.python.org/3.11/whatsnew/3.11.html
 
-#if PY_VERSION_HEX < 0x030900B1
+#define IS_PYPY 1
+#if PY_VERSION_HEX < 0x030900B1 || !defined(IS_PYPY)
 static inline PyCodeObject* PyFrame_GetCode(PyFrameObject* frame) {
   Py_INCREF(frame->f_code);
   return frame->f_code;
@@ -96,7 +97,7 @@ static inline void _Py_SET_TYPE(PyObject* ob, PyTypeObject* type) {
 #define Py_SET_TYPE(ob, type) _Py_SET_TYPE((PyObject*)(ob), type)
 #endif
 
-#if PY_VERSION_HEX < ((3 << 24) | (11 << 16) | (0 << 8) | (0xA << 4) | (4 << 0))
+#if PY_VERSION_HEX < ((3 << 24) | (11 << 16) | (0 << 8) | (0xA << 4) | (4 << 0)) || !defined(IS_PYPY)
 static inline PyObject* PyFrame_GetLocals(PyFrameObject* frame) {
   PyFrame_FastToLocals(frame);
   auto res = frame->f_locals;
